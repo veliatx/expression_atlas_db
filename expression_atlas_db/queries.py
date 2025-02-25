@@ -180,8 +180,8 @@ def fetch_sequenceregions(
         sequenceregions_df (pd.DataFrame): Sequenceregions dataframe
     """
 
-    transcript_query = select(base.Transcript)
-    gene_query = select(base.Gene)
+    transcript_query = session.query(base.Transcript)
+    gene_query = session.query(base.Gene)
 
     if sequenceregions:
         if exact_id_match:
@@ -205,9 +205,17 @@ def fetch_sequenceregions(
         )
         gene_query = gene_query.filter(base.Gene.assembly_id == assembly_id)
 
-    transcript_sequenceregions_df = pd.read_sql(transcript_query, session.bind)
-    transcript_sequenceregions_df.drop("gene_id", inplace=True, axis=1)
-    gene_sequenceregions_df = pd.read_sql(gene_query, session.bind)
+    transcript_results = transcript_query.all()
+    gene_results = gene_query.all()
+    
+    transcript_sequenceregions_df = pd.DataFrame([row.__dict__ for row in transcript_results])
+    if not transcript_sequenceregions_df.empty:
+        transcript_sequenceregions_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
+        transcript_sequenceregions_df.drop("gene_id", inplace=True, axis=1)
+    
+    gene_sequenceregions_df = pd.DataFrame([row.__dict__ for row in gene_results])
+    if not gene_sequenceregions_df.empty:
+        gene_sequenceregions_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
 
     sequenceregions_df = pd.concat(
         [transcript_sequenceregions_df, gene_sequenceregions_df], axis=0
@@ -248,17 +256,19 @@ def fetch_samplecontrasts(
         samplecontrast_df (pd.DataFrame): Sample contrasts dataframe
     """
 
-    query = (
-        select(
-            base.Contrast,
-            base.Study.internal_id,
-            base.SampleContrast.contrast_side,
-            base.Sample,
-        )
-        .join(base.Study, base.Study.id == base.Contrast.study_id)
-        .join(base.SampleContrast, base.Contrast.id == base.SampleContrast.contrast_id)
-        .join(base.Sample, base.SampleContrast.sample_id == base.Sample.id)
+    query = session.query(
+        base.Contrast,
+        base.Study.internal_id,
+        base.SampleContrast.contrast_side,
+        base.Sample
+    ).join(
+        base.Study, base.Study.id == base.Contrast.study_id
+    ).join(
+        base.SampleContrast, base.Contrast.id == base.SampleContrast.contrast_id
+    ).join(
+        base.Sample, base.SampleContrast.sample_id == base.Sample.id
     )
+    
     if studies:
         query = query.filter(base.Study.internal_id.in_(studies))
     if public:
@@ -266,7 +276,19 @@ def fetch_samplecontrasts(
     if contrasts:
         query = query.filter(base.Contrast.contrast_name.in_(contrasts))
 
-    samplecontrasts_df = pd.read_sql(query, session.bind)
+    results = query.all()
+    
+    # Convert results to dataframe
+    rows = []
+    for row in results:
+        contrast, internal_id, contrast_side, sample = row
+        row_dict = {**contrast.__dict__, **sample.__dict__}
+        row_dict["internal_id"] = internal_id
+        row_dict["contrast_side"] = contrast_side
+        rows.append(row_dict)
+    
+    samplecontrasts_df = pd.DataFrame(rows)
+    samplecontrasts_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
 
     samplecontrasts_df = pd.concat(
         [
@@ -299,16 +321,28 @@ def fetch_samples(
     Returns:
         samples_df (pd.DataFrame): Samples dataframe
     """
-    query = select(base.Sample, base.Study.internal_id).join(
+    query = session.query(base.Sample, base.Study.internal_id).join(
         base.Study, base.Study.id == base.Sample.study_id
     )
+    
     if studies:
         query = query.filter(base.Study.internal_id.in_(studies))
-
     if public:
         query = query.filter(base.Study.public == True)
 
-    samples_df = pd.read_sql(query, session.bind)
+    results = query.all()
+    
+    # Convert results to dataframe
+    rows = []
+    for row in results:
+        sample, internal_id = row
+        row_dict = {**sample.__dict__}
+        row_dict["internal_id"] = internal_id
+        rows.append(row_dict)
+    
+    samples_df = pd.DataFrame(rows)
+    samples_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
+    
     samples_df = pd.concat(
         [
             samples_df,
@@ -333,7 +367,7 @@ def fetch_studyqueue(
     Returns:
         studyqueues_df (pd.DataFrame): Study queue dataframe
     """
-    query = select(
+    query = session.query(
         base.StudyQueue,
         base.Study.id.label("study_id"),
         base.Study.public.label("data_released"),
@@ -342,13 +376,25 @@ def fetch_studyqueue(
         base.StudyQueue.study_id == base.Study.id,
         isouter=True,
     )
+    
     if public:
         query = query.filter(base.StudyQueue.public == True)
 
-    return pd.read_sql(
-        query,
-        con=session.bind,
-    )
+    results = query.all()
+    
+    # Convert results to dataframe
+    rows = []
+    for row in results:
+        studyqueue, study_id, data_released = row
+        row_dict = {**studyqueue.__dict__}
+        row_dict["study_id"] = study_id
+        row_dict["data_released"] = data_released
+        rows.append(row_dict)
+    
+    studyqueues_df = pd.DataFrame(rows)
+    studyqueues_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
+    
+    return studyqueues_df
 
 
 def update_studyqueue(
@@ -538,29 +584,36 @@ def query_differentialexpression(
         differentialexpression_df (pd.DataFrame): Differential expression dataframe
     """
 
-    columns = list(base.Contrast.__table__.columns) + list(base.Study.__table__.columns)
+    log10_padj_threshold = float(np.log10(0.05))
+    log2_fc_threshold = float(np.log2(2.0))
 
-    studies_query = session.query(*columns).join(
+    # Query for contrasts and studies
+    studies_query = session.query(
+        base.Contrast,
+        base.Study.internal_id
+    ).join(
         base.Study, base.Contrast.study_id == base.Study.id
     )
 
     if studies:
         studies_query = studies_query.filter(base.Study.internal_id.in_(studies))
-
     if public:
         studies_query = studies_query.filter(base.Study.public == True)
-
     if contrasts:
         studies_query = studies_query.filter(base.Contrast.contrast_name.in_(contrasts))
 
     results = studies_query.all()
-
-    #df = pd.DataFrame([row.__dict__ for row in results])  
-    df = pd.DataFrame([row._asdict() for row in results])
-
-    studies_df = df.drop(columns=['_sa_instance_state'], errors='ignore')
-
-    #studies_df = pd.read_sql(str(studies_query), session.bind)
+    
+    # Convert results to dataframe
+    rows = []
+    for row in results:
+        contrast, internal_id = row
+        row_dict = {**contrast.__dict__}
+        row_dict["internal_id"] = internal_id
+        rows.append(row_dict)
+    
+    studies_df = pd.DataFrame(rows)
+    studies_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
     studies_df.set_index("id", inplace=True)
 
     sequenceregions_df = fetch_sequenceregions(
@@ -570,7 +623,7 @@ def query_differentialexpression(
         exact_id_match=exact_id_match,
     )
 
-    differentialexpression_query = select(base.DifferentialExpression).filter(
+    differentialexpression_query = session_redshift.query(base.DifferentialExpression).filter(
         base.DifferentialExpression.contrast_id.in_(studies_df.index)
     )
 
@@ -595,9 +648,10 @@ def query_differentialexpression(
             func.abs(base.DifferentialExpression.log2foldchange) >= log2_fc_threshold
         )
 
-    differentialexpression_df = pd.read_sql(
-        differentialexpression_query, session_redshift.bind
-    )
+    results = differentialexpression_query.all()
+    differentialexpression_df = pd.DataFrame([row.__dict__ for row in results])
+    differentialexpression_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
+    
     differentialexpression_df = differentialexpression_df.merge(
         studies_df[["internal_id", "contrast_name"]],
         left_on="contrast_id",
@@ -648,8 +702,8 @@ def query_samplemeasurement(
     Returns:
         samplemeasurement_df (pd.DataFrame): Sample measurements dataframe
     """
-    samples_query = select(base.Sample, base.Study.internal_id).join(
-        base.Sample, base.Sample.study_id == base.Study.id
+    samples_query = session.query(base.Sample, base.Study.internal_id).join(
+        base.Study, base.Sample.study_id == base.Study.id
     )
     if studies:
         samples_query = samples_query.filter(base.Study.internal_id.in_(studies))
@@ -661,27 +715,72 @@ def query_samplemeasurement(
         samples_query = samples_query.filter(base.Sample.srx_id.in_(samples))
 
     if contrasts:
-        contrast_subquery = (
-            select(
-                base.Study.internal_id,
-                base.Contrast.contrast_name,
-                base.SampleContrast.contrast_side,
-                base.SampleContrast.sample_id,
-            )
-            .filter(base.Study.internal_id.in_(studies))
-            .filter(base.Contrast.contrast_name.in_(contrasts))
-            .join(base.Contrast, base.Contrast.study_id == base.Study.id)
-            .join(
-                base.SampleContrast, base.Contrast.id == base.SampleContrast.contrast_id
-            )
-            .subquery()
+        # This is more complex with ORM style, we need to handle it differently
+        contrast_query = session.query(
+            base.Study.internal_id,
+            base.Contrast.contrast_name,
+            base.SampleContrast.contrast_side,
+            base.SampleContrast.sample_id
+        ).join(
+            base.Contrast, base.Contrast.study_id == base.Study.id
+        ).join(
+            base.SampleContrast, base.Contrast.id == base.SampleContrast.contrast_id
         )
-        samples_subquery = samples_query.subquery()
-        samples_query = select(contrast_subquery, samples_subquery).join(
-            contrast_subquery, samples_subquery.c.id == contrast_subquery.c.sample_id
+        
+        if studies:
+            contrast_query = contrast_query.filter(base.Study.internal_id.in_(studies))
+        if contrasts:
+            contrast_query = contrast_query.filter(base.Contrast.contrast_name.in_(contrasts))
+            
+        contrast_results = contrast_query.all()
+        contrast_rows = []
+        for row in contrast_results:
+            internal_id, contrast_name, contrast_side, sample_id = row
+            contrast_rows.append({
+                "internal_id": internal_id,
+                "contrast_name": contrast_name,
+                "contrast_side": contrast_side,
+                "sample_id": sample_id
+            })
+        contrast_df = pd.DataFrame(contrast_rows)
+        
+        # Get sample results
+        sample_results = samples_query.all()
+        sample_rows = []
+        for row in sample_results:
+            sample, internal_id = row
+            sample_rows.append({
+                "id": sample.id,
+                "internal_id": internal_id,
+                "srx_id": sample.srx_id,
+                "atlas_group": sample.atlas_group,
+                "fields": sample.fields
+            })
+        samples_df = pd.DataFrame(sample_rows)
+        
+        # Merge the two dataframes
+        samples_df = pd.merge(
+            samples_df,
+            contrast_df,
+            left_on=["id", "internal_id"],
+            right_on=["sample_id", "internal_id"],
+            how="inner"
         )
-
-    samples_df = pd.read_sql(samples_query, session.bind)
+    else:
+        # Get sample results without contrast filtering
+        sample_results = samples_query.all()
+        sample_rows = []
+        for row in sample_results:
+            sample, internal_id = row
+            sample_rows.append({
+                "id": sample.id,
+                "internal_id": internal_id,
+                "srx_id": sample.srx_id,
+                "atlas_group": sample.atlas_group,
+                "fields": sample.fields
+            })
+        samples_df = pd.DataFrame(sample_rows)
+    
     samples_df.set_index("id", inplace=True)
 
     sequenceregions_df = fetch_sequenceregions(
@@ -691,7 +790,7 @@ def query_samplemeasurement(
         exact_id_match=exact_id_match,
     )
 
-    samplemeasurement_query = select(base.SampleMeasurement).filter(
+    samplemeasurement_query = session_redshift.query(base.SampleMeasurement).filter(
         base.SampleMeasurement.sample_id.in_(samples_df.index)
     )
 
@@ -700,29 +799,41 @@ def query_samplemeasurement(
             base.SampleMeasurement.sequenceregion_id.in_(sequenceregions_df.index)
         )
 
-    samplemeasurement_df = pd.read_sql(samplemeasurement_query, session_redshift.bind)
-    samplemeasurement_df = samplemeasurement_df.merge(
-        pd.concat(
-            [
-                samples_df[
-                    ["internal_id", "srx_id", "atlas_group", "fields"]
-                    + ([] if not contrasts else ["contrast_name", "contrast_side"])
-                ],
-                samples_df["fields"].apply(
-                    lambda x: unpack_fields(
-                        x,
-                        lambda x: x
-                        in (
-                            "sample_condition_1",
-                            "sample_condition_2",
-                            "sample_type_1",
-                            "sample_type_2",
-                        ),
-                    )
+    results = samplemeasurement_query.all()
+    samplemeasurement_df = pd.DataFrame([row.__dict__ for row in results])
+    samplemeasurement_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
+    
+    # Add fields unpacking to samples_df
+    if "fields" in samples_df.columns:
+        unpacked_fields = samples_df["fields"].apply(
+            lambda x: unpack_fields(
+                x,
+                lambda x: x in (
+                    "sample_condition_1",
+                    "sample_condition_2",
+                    "sample_type_1",
+                    "sample_type_2",
                 ),
-            ],
-            axis=1,
-        ),
+            )
+        )
+        samples_df = pd.concat([samples_df, unpacked_fields], axis=1)
+    
+    # Prepare columns for merge
+    sample_columns = ["internal_id", "srx_id", "atlas_group"]
+    if "contrast_name" in samples_df.columns:
+        sample_columns.extend(["contrast_name", "contrast_side"])
+    
+    # Add fields column if it exists
+    if "fields" in samples_df.columns:
+        sample_columns.append("fields")
+    
+    # Add condition and type columns if they exist
+    for col in samples_df.columns:
+        if col.startswith(("sample_condition_", "sample_type_")):
+            sample_columns.append(col)
+    
+    samplemeasurement_df = samplemeasurement_df.merge(
+        samples_df[sample_columns],
         left_on="sample_id",
         right_index=True,
         how="left",
@@ -848,24 +959,34 @@ def query_percentile_group(
     if aggregate_column not in vars(base.SampleMeasurement).keys():
         raise KeyError("Aggregate_column does not exist in samplemeasurement table.")
 
-    query = select(
-        base.SampleMeasurement.sequenceregion_id,
-        *[
-            func.percentile_disc(i)
-            .within_group(vars(base.SampleMeasurement)[aggregate_column])
-            .over(partition_by=base.SampleMeasurement.sequenceregion_id)
-            .label(f"perc_{i}")
-            for i in percentile_levels
-        ],
-    ).filter(base.SampleMeasurement.sample_id.in_(sample_ids))
-
+    # This function requires raw SQL for the percentile calculations
+    # We'll need to use a more direct approach with SQLAlchemy core
+    from sqlalchemy.sql import text
+    
+    # Build the SQL query manually
+    percentile_cols = ", ".join([
+        f"PERCENTILE_DISC({i}) WITHIN GROUP (ORDER BY {aggregate_column}) OVER (PARTITION BY sequenceregion_id) AS perc_{i}"
+        for i in percentile_levels
+    ])
+    
+    sql = f"""
+    SELECT DISTINCT sequenceregion_id, {percentile_cols}
+    FROM sample_measurement
+    WHERE sample_id IN :sample_ids
+    """
+    
+    params = {"sample_ids": tuple(sample_ids)}
+    
     if sequenceregion_ids:
-        query = query.filter(
-            base.SampleMeasurement.sequenceregion_id.in_(sequenceregion_ids)
-        )
-
-    percentile_df = pd.read_sql(query.distinct(), session_redshift.bind)
-
+        sql += " AND sequenceregion_id IN :sequenceregion_ids"
+        params["sequenceregion_ids"] = tuple(sequenceregion_ids)
+    
+    # Execute the raw SQL
+    result = session_redshift.execute(text(sql), params)
+    
+    # Convert to DataFrame
+    percentile_df = pd.DataFrame([dict(row) for row in result])
+    
     return percentile_df
 
 
@@ -896,13 +1017,23 @@ def build_study_adata_components(
         result (Union[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], ad.AnnData]):
             Either (long_df, obs_df, var_df) tuple or AnnData object
     """
-    samples_query = (
-        select(base.Sample, base.Study.internal_id)
-        .join(base.Sample, base.Sample.study_id == base.Study.id)
-        .filter(base.Study.internal_id.in_(studies))
-    )
+    samples_query = session.query(base.Sample, base.Study.internal_id).join(
+        base.Study, base.Sample.study_id == base.Study.id
+    ).filter(base.Study.internal_id.in_(studies))
 
-    samples_df = pd.read_sql(samples_query, session.bind).drop("id_1", axis=1)
+    sample_results = samples_query.all()
+    sample_rows = []
+    for row in sample_results:
+        sample, internal_id = row
+        sample_rows.append({
+            **sample.__dict__,
+            "internal_id": internal_id
+        })
+    
+    samples_df = pd.DataFrame(sample_rows)
+    samples_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
+    samples_df.drop("id_1", axis=1, errors='ignore')
+    
     samples_df = pd.concat(
         [
             samples_df,
@@ -922,22 +1053,28 @@ def build_study_adata_components(
             session,
             sequenceregions_type=sequenceregions_type,
         )
-        .drop(["assembly_id", "id_1"], axis=1)
+        .drop(["assembly_id", "id_1"], axis=1, errors='ignore')
         .sort_index()
     )
 
     if sequenceregions_type == "transcript":
-        sequenceregions_df.drop("gene_id", inplace=True, axis=1)
+        sequenceregions_df.drop("gene_id", inplace=True, axis=1, errors='ignore')
     else:
-        sequenceregions_df.drop("transcript_id", inplace=True, axis=1)
+        sequenceregions_df.drop("transcript_id", inplace=True, axis=1, errors='ignore')
 
-    samplemeasurement_query = select(base.SampleMeasurement).filter(
+    samplemeasurement_query = session_redshift.query(base.SampleMeasurement).filter(
         base.SampleMeasurement.sample_id.in_(samples_df.index)
     )
 
-    samplemeasurement_df = pd.read_sql(
-        samplemeasurement_query, session_redshift.bind
-    ).drop("id", axis=1)
+    samplemeasurement_results = samplemeasurement_query.all()
+    samplemeasurement_rows = []
+    for row in samplemeasurement_results:
+        samplemeasurement_rows.append(row.__dict__)
+    
+    samplemeasurement_df = pd.DataFrame(samplemeasurement_rows)
+    samplemeasurement_df.drop("_sa_instance_state", axis=1, inplace=True, errors='ignore')
+    samplemeasurement_df.drop("id", axis=1, errors='ignore')
+    
     samplemeasurement_df = samplemeasurement_df.loc[
         samplemeasurement_df["sequenceregion_id"].isin(sequenceregions_df.index)
     ].reset_index(drop=True)
