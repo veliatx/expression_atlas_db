@@ -90,15 +90,19 @@ def fetch_studies(
     Returns:
         studies_df (pd.DataFrame): Studies dataframe
     """
-    query = select(base.Study)
+    query = session.query(base.Study)
 
     if studies:
-        query = query.filter(base.Study.internal_id.in_(studies))
+        query = session.query(base.Study).filter(base.Study.internal_id.in_(studies))
 
     if public:
-        query = query.filter(base.Study.public == True)
+        query = session.query(base.Study).filter(base.Study.public == True)
 
-    studies_df = pd.read_sql(query, session.bind)
+    results = query.all()
+
+    df = pd.DataFrame([row.__dict__ for row in results])  
+
+    studies_df = df.drop(columns=['_sa_instance_state'], errors='ignore')
 
     return studies_df
 
@@ -120,20 +124,36 @@ def fetch_contrasts(
     Returns:
         contrasts_df (pd.DataFrame): Contrasts dataframe
     """
-    query = select(base.Contrast, base.Study).join(
+
+    columns = list(base.Contrast.__table__.columns) + list(base.Study.__table__.columns)
+
+    query = session.query(*columns).join(
         base.Study, base.Contrast.study_id == base.Study.id
     )
 
     if studies:
-        query = query.filter(base.Study.internal_id.in_(studies))
+        query = session.query(*columns).join(
+                              base.Study, base.Contrast.study_id == base.Study.id
+                        ).filter(base.Study.internal_id.in_(studies))
 
     if contrasts:
-        query = query.filter(base.Contrast.conrast_name.in_(contrasts))
+        query = session.query(*columns).join(
+                              base.Study, base.Contrast.study_id == base.Study.id
+                        ).filter(base.Contrast.conrast_name.in_(contrasts))
 
     if public:
-        query = query.filter(base.Study.public == True)
+        query = session.query(*columns).join(
+                              base.Study, base.Contrast.study_id == base.Study.id
+                        ).filter(base.Study.public == True)
 
-    contrasts_df = pd.read_sql(query, session.bind)
+
+    results = query.all()
+
+    #df = pd.DataFrame([row.__dict__ for row in results])  
+
+    contrasts_df = pd.DataFrame([row._asdict() for row in results])
+
+    #contrasts_df = pd.read_sql(query, session.bind)
 
     return contrasts_df
 
@@ -517,7 +537,10 @@ def query_differentialexpression(
     Returns:
         differentialexpression_df (pd.DataFrame): Differential expression dataframe
     """
-    studies_query = select(base.Contrast, base.Study.internal_id).join(
+
+    columns = list(base.Contrast.__table__.columns) + list(base.Study.__table__.columns)
+
+    studies_query = session.query(*columns).join(
         base.Study, base.Contrast.study_id == base.Study.id
     )
 
@@ -530,7 +553,14 @@ def query_differentialexpression(
     if contrasts:
         studies_query = studies_query.filter(base.Contrast.contrast_name.in_(contrasts))
 
-    studies_df = pd.read_sql(studies_query, session.bind)
+    results = studies_query.all()
+
+    #df = pd.DataFrame([row.__dict__ for row in results])  
+    df = pd.DataFrame([row._asdict() for row in results])
+
+    studies_df = df.drop(columns=['_sa_instance_state'], errors='ignore')
+
+    #studies_df = pd.read_sql(str(studies_query), session.bind)
     studies_df.set_index("id", inplace=True)
 
     sequenceregions_df = fetch_sequenceregions(
